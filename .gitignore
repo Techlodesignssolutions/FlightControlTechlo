@@ -1,0 +1,41 @@
+# Build directories
+build/
+_deps/
+
+# Visual Studio / Visual Studio Code
+.vs/
+.vscode/
+*.vcxproj.user
+*.vcxproj.filters
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+
+# Compiled binaries
+*.exe
+*.lib
+*.dll
+*.so
+*.dylib
+*.a
+
+# IDE files
+*.sln
+*.vcxproj
+*.vcxproj.user
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*~
+*.swp
+*.tmp 
