@@ -14,10 +14,10 @@ FixedWingMixer::FixedWingMixer(HAL* hal, const Config& config)
       wind_compensation_{0.0f, 0.0f, 0.0f, 0.0f, 0.0f} {  // Initialize in initializer list
     
     // Initialize servo channels
-    left_elevon_channel_ = 0;
-    right_elevon_channel_ = 1;
-    rudder_channel_ = 2;
-    throttle_channel_ = 0;
+    left_elevon_channel_ = config_.left_elevon_channel;
+    right_elevon_channel_ = config_.right_elevon_channel;
+    rudder_channel_ = config_.rudder_channel;
+    throttle_channel_ = config_.motor_channel;
     
     // Initialize trim positions
     left_elevon_trim_ = 0.0f;
@@ -41,23 +41,21 @@ bool FixedWingMixer::initialize() {
         return false;
     }
     
-    // Initialize servo outputs
-    if (!hal_->initServos()) {
-        return false;
+    if (initialized_) {
+        return true;
     }
     
-    // Initialize motor outputs  
-    if (!hal_->initMotors()) {
-        return false;
+    // Initialize servo and motor outputs
+    initialized_ = hal_->initServos() && hal_->initMotors();
+    
+    if (initialized_) {
+        // Set all controls to neutral/safe positions
+        emergencyStop();    // drives all servos/motor to neutral
+        clearEmergency();   // now unlock "normal" applyControls()
+        last_update_time_ = hal_->millis();
     }
     
-    // Set all controls to neutral/safe positions
-    emergencyStop();
-    
-    initialized_ = true;
-    last_update_time_ = hal_->millis();
-    
-    return true;
+    return initialized_;
 }
 
 // Main mixing function
@@ -100,29 +98,17 @@ ControlSurfaces FixedWingMixer::mix(const AngularRates& pid_outputs,
     return controls;
 }
 
-// Apply controls to hardware
+// Apply controls to hardware (normal path with emergency gate)
 void FixedWingMixer::applyControls(const ControlSurfaces& controls) {
     if (!hal_ || !initialized_ || emergency_mode_) {
         return;
     }
     
-    // Convert control surface commands to servo positions
-    // Assuming servo range is 0.0 to 1.0, centered at 0.5
+    // Store current controls
+    current_controls_ = controls;
     
-    // Left elevon
-    float left_elevon_pos = 0.5f + (controls.left_elevon * 0.5f);
-    writeServoPosition(left_elevon_channel_, left_elevon_pos);
-    
-    // Right elevon
-    float right_elevon_pos = 0.5f + (controls.right_elevon * 0.5f);
-    writeServoPosition(right_elevon_channel_, right_elevon_pos);
-    
-    // Rudder
-    float rudder_pos = 0.5f + (controls.rudder * 0.5f);
-    writeServoPosition(rudder_channel_, rudder_pos);
-    
-    // Throttle
-    writeThrottlePosition(throttle_channel_, controls.throttle);
+    // Delegate to the low-level write function
+    writeActuators(controls);
 }
 
 // Emergency stop - set all controls to safe positions
@@ -133,18 +119,16 @@ void FixedWingMixer::emergencyStop() {
     
     emergency_mode_ = true;
     
-    // Set all servos to neutral (0.5 normalized position)
-    for (int i = 0; i < 8; i++) { // Assuming max 8 servo channels
-        writeServoPosition(i, 0.5f);
-    }
-    
-    // Set all motors to minimum (0.0 throttle)
-    for (int i = 0; i < 6; i++) { // Assuming max 6 motor channels
-        writeThrottlePosition(i, 0.0f);
-    }
-    
-    // Reset current controls
-    current_controls_ = ControlSurfaces();
+    // Drive actuators to safe neutral position, bypassing normal emergency gate
+    ControlSurfaces safe_controls{0.0f, 0.0f, 0.0f, 0.0f};
+    writeActuators(safe_controls);
+    current_controls_ = safe_controls;
+}
+
+// Clear emergency mode to allow normal control
+void FixedWingMixer::clearEmergency() {
+    emergency_mode_ = false;
+    // Reset integrators, trims, etc. if needed in the future
 }
 
 // Static elevon mixing function
@@ -178,11 +162,10 @@ float FixedWingMixer::scaleControlAuthority(float command, float airspeed, float
 }
 
 // Calculate coordination rudder command
-float FixedWingMixer::calculateCoordination(float roll_rate, float yaw_rate, float airspeed) {
-    // Simplified coordinated turn calculation
-    // In a coordinated turn, yaw rate should be proportional to roll rate
-    float desired_yaw_rate = roll_rate * 0.1f; // Simplified relationship
-    return (desired_yaw_rate - yaw_rate) * 0.5f;
+float FixedWingMixer::calculateCoordination(float roll_rate, float /*yaw_rate*/, float airspeed) {
+    // At higher airspeeds, less rudder deflection is needed for coordination
+    if (airspeed <= 0.0f) return 0.0f;
+    return roll_rate / airspeed;
 }
 
 // ========== PRIVATE METHOD IMPLEMENTATIONS ==========
@@ -327,22 +310,26 @@ void FixedWingMixer::updateControlHistory(float value, float* history) {
     history[history_index_] = value;
 }
 
-// Write servo position
-void FixedWingMixer::writeServoPosition(int channel, float position_normalized) {
+// Low-level actuator control that bypasses emergency mode checks
+void FixedWingMixer::writeActuators(const ControlSurfaces& controls) {
     if (!hal_) return;
     
-    // Clamp to valid range
-    position_normalized = std::max(0.0f, std::min(1.0f, position_normalized));
+    // Helper to normalize control commands [-1…1] → [0…1] with trim
+    auto normalize = [](float cmd, float trim) { 
+        return std::max(0.0f, std::min(1.0f, (cmd + trim + 1.0f) * 0.5f)); 
+    };
     
-    hal_->writeServo(channel, position_normalized);
+    // Write servo positions with trim applied
+    hal_->writeServo(left_elevon_channel_, 
+                     normalize(controls.left_elevon, left_elevon_trim_));
+    hal_->writeServo(right_elevon_channel_, 
+                     normalize(controls.right_elevon, right_elevon_trim_));
+    hal_->writeServo(rudder_channel_, 
+                     normalize(controls.rudder, rudder_trim_));
+    
+    // Throttle is already 0…1 but clamp to config limits
+    float throttle = std::max(config_.min_throttle, 
+                             std::min(config_.max_throttle, controls.throttle));
+    hal_->writeMotor(throttle_channel_, throttle);
 }
 
-// Write throttle position
-void FixedWingMixer::writeThrottlePosition(int channel, float throttle_normalized) {
-    if (!hal_) return;
-    
-    // Clamp to valid range
-    throttle_normalized = std::max(0.0f, std::min(1.0f, throttle_normalized));
-    
-    hal_->writeMotor(channel, throttle_normalized);
-} 

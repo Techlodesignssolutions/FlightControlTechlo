@@ -5,12 +5,15 @@
  * with various scenarios and edge cases.
  */
 
+#define CATCH_CONFIG_MAIN
 #include <catch2/catch.hpp>
+
+// Disambiguate: pull in only the FP-Approx class, not the vector matcher
+using Catch::Detail::Approx;
+
 #include "mocks/MockHAL.h"
 #include "estimation/StateEstimator.h"
 #include <cmath>
-
-using namespace Catch;
 
 // Helper function to check if two angles are approximately equal (handles wrap-around)
 bool angleApprox(float a, float b, float tolerance = 1.0f) {

@@ -11,12 +11,15 @@
  * ctest --output-on-failure
  */
 
+#define CATCH_CONFIG_MAIN
 #include <catch2/catch.hpp>
+
+// Disambiguate: pull in only the FP-Approx class, not the vector matcher
+using Catch::Detail::Approx;
+
 #include "mocks/MockHAL.h"
 #include "control/AdaptivePID.h"
 #include <cmath>
-
-using namespace Catch;
 
 TEST_CASE("AdaptivePID 4D Gain Interpolation", "[adaptive_pid]") {
     AdaptivePID::Config config;

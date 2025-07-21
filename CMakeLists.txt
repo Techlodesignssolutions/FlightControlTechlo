@@ -38,7 +38,7 @@ FetchContent_Declare(
     GIT_REPOSITORY https://github.com/catchorg/Catch2.git
     GIT_TAG        v2.13.10   # Use stable v2.x branch for compatibility
 )
-FetchContent_MakeAvailable(Catch2)   # <-- this defines Catch2::Catch2WithMain and its include dirs
+FetchContent_MakeAvailable(Catch2)
 
 # Now pull in your test folder
 if(BUILD_TESTING)

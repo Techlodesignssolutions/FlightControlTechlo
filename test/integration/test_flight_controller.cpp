@@ -5,12 +5,15 @@
  * working together in realistic scenarios.
  */
 
+#define CATCH_CONFIG_MAIN
 #include <catch2/catch.hpp>
+
+// Disambiguate: pull in only the FP-Approx class, not the vector matcher
+using Catch::Detail::Approx;
+
 #include "mocks/MockHAL.h"
 #include "core/FlightController.h"
 #include <cmath>
-
-using namespace Catch;
 
 // Helper function to simulate a complete flight scenario
 void simulateFlightLoop(FlightController& fc, MockHAL& hal, int iterations, float dt = 0.002f) {

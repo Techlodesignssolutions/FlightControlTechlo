@@ -5,12 +5,15 @@
  * airspeed scaling, and safety systems.
  */
 
+#define CATCH_CONFIG_MAIN
 #include <catch2/catch.hpp>
+
+// Disambiguate: pull in only the FP-Approx class, not the vector matcher
+using Catch::Detail::Approx;
+
 #include "mocks/MockHAL.h"
 #include "mixing/FixedWingMixer.h"
 #include <cmath>
-
-using namespace Catch;
 
 TEST_CASE("FixedWingMixer Initialization", "[FixedWingMixer]") {
     MockHAL hal;

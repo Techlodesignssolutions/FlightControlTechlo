@@ -55,6 +55,12 @@ public:
         // Throttle management
         bool enable_throttle_dithering = true; // Allow throttle dithering for airspeed estimation
         float idle_throttle = 0.1f;            // Idle throttle setting
+        
+        // Hardware channel mapping
+        int left_elevon_channel = 0;           // Left elevon servo channel
+        int right_elevon_channel = 1;          // Right elevon servo channel  
+        int rudder_channel = 2;                // Rudder servo channel
+        int motor_channel = 0;                 // Motor/throttle channel
     };
     
     /**
@@ -103,6 +109,11 @@ public:
      * Emergency stop - set all controls to safe positions
      */
     void emergencyStop();
+    
+    /**
+     * Clear emergency mode to allow normal control
+     */
+    void clearEmergency();
     
     /**
      * Get current control surface positions (for feedback/logging)
@@ -171,7 +182,7 @@ private:
     float rateLimitControl(float new_value, const float* history, int samples, float max_rate, float dt);
     void updateControlHistory(float value, float* history);
     
-    // Servo output helpers
-    void writeServoPosition(int channel, float position_normalized);
-    void writeThrottlePosition(int channel, float throttle_normalized);
+    // Low-level actuator control that bypasses emergency mode checks
+    void writeActuators(const ControlSurfaces& controls);
+
 }; 
