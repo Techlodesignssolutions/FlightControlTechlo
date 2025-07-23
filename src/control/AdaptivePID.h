@@ -1,6 +1,7 @@
 #pragma once
 #include "../core/Types.h"
 #include <stdint.h>
+#include <vector>
 
 /**
  * 4D Adaptive PID Controller with Gain Scheduling
@@ -82,6 +83,12 @@ public:
     void updatePerformance(const Attitude& errors, const AngularRates& pid_outputs, float dt);
     
     /**
+     * Update current flight regime for learning
+     * Call this with current flight conditions
+     */
+    void updateFlightRegime(const FlightRegime& regime);
+    
+    /**
      * Set adaptation rate (typically controlled by wind analysis)
      */
     void setAdaptationRate(float rate);
@@ -129,6 +136,10 @@ private:
     LearningState learning_state_;
     float adaptation_rate_;
     bool learning_frozen_;
+    
+    // Current flight regime tracking for learning
+    FlightRegime current_regime_;
+    FlightRegime previous_regime_;
     
     // 4D gain schedule lookup table
     ControlGains gain_schedule_[Config::THROTTLE_ZONES]
@@ -178,17 +189,34 @@ private:
     uint32_t last_update_time_;
     uint32_t adaptation_counter_;
     
+    // Track which corners were modified for efficient clamping
+    struct CornerIndex {
+        int t, a, p, s;
+        CornerIndex(int t_, int a_, int p_, int s_) : t(t_), a(a_), p(p_), s(s_) {}
+    };
+    std::vector<CornerIndex> modified_corners_;
+    
     // Internal methods
     void initializeGainSchedule();
     void updateAxisPerformance(float error, float output, float dt, PerformanceMetrics& metrics);
     void adaptGainsIfNeeded();
-    float calculateAdaptationDirection(const PerformanceMetrics& metrics) const;
     bool shouldRollback(const PerformanceMetrics& current, const PerformanceMetrics& previous) const;
     void saveSnapshot(const ControlGains& gains, const PerformanceMetrics& performance);
     void rollbackToPreviousGains();
     void updateLearningState();
     float calculateAxisConfidence(const PerformanceMetrics& metrics);
     static float findInterpolationIndex(float value, const float* zones, int num_zones, int& index);
+    
+    // Full learning implementation methods
+    ControlGains calculateGainAdjustments();
+    void updateCornerValues(int t_idx, int a_idx, int p_idx, int s_idx,
+                           float t_factor, float a_factor, float p_factor, float s_factor,
+                           const ControlGains& delta_gains);
+    FlightRegime getCurrentRegime() const;
+    void clampGainsToLimits();
+    void clampSingleAxisGains(PIDGains& gains);
+    float calculatePerformanceGradient(const PerformanceMetrics& metrics) const;
+    PIDGains calculateAxisGainAdjustment(const PerformanceMetrics& metrics, float base_adjustment) const;
     
     // Enhanced performance analysis
     void updatePerformanceBuffers(const Attitude& errors, const AngularRates& outputs);
@@ -206,4 +234,42 @@ private:
         float v1100, float v1010, float v1001, float v0110, float v0101,
         float v0011, float v1110, float v1101, float v1011, float v0111, float v1111,
         float t, float a, float p, float s);
+    
+    // Template function to interpolate axis gains from corner values (defined inline for linkage)
+    template<typename AxisExtractor>
+    static PIDGains interpolateAxisGains(const ControlGains corners[16], 
+                                        AxisExtractor extractor,
+                                        float t_factor, float a_factor, float p_factor, float s_factor) {
+        PIDGains result;
+        
+        // Extract the 16 corner gains for this axis
+        PIDGains axis_corners[16];
+        for (int i = 0; i < 16; i++) {
+            axis_corners[i] = extractor(corners[i]);
+        }
+        
+        // Interpolate each PID component separately
+        result.kp = interpolateScalar4D(
+            axis_corners[0].kp,  axis_corners[1].kp,  axis_corners[2].kp,  axis_corners[3].kp,  axis_corners[4].kp,
+            axis_corners[5].kp,  axis_corners[6].kp,  axis_corners[7].kp,  axis_corners[8].kp,  axis_corners[9].kp,
+            axis_corners[10].kp, axis_corners[11].kp, axis_corners[12].kp, axis_corners[13].kp, axis_corners[14].kp, axis_corners[15].kp,
+            t_factor, a_factor, p_factor, s_factor);
+        
+        result.ki = interpolateScalar4D(
+            axis_corners[0].ki,  axis_corners[1].ki,  axis_corners[2].ki,  axis_corners[3].ki,  axis_corners[4].ki,
+            axis_corners[5].ki,  axis_corners[6].ki,  axis_corners[7].ki,  axis_corners[8].ki,  axis_corners[9].ki,
+            axis_corners[10].ki, axis_corners[11].ki, axis_corners[12].ki, axis_corners[13].ki, axis_corners[14].ki, axis_corners[15].ki,
+            t_factor, a_factor, p_factor, s_factor);
+        
+        result.kd = interpolateScalar4D(
+            axis_corners[0].kd,  axis_corners[1].kd,  axis_corners[2].kd,  axis_corners[3].kd,  axis_corners[4].kd,
+            axis_corners[5].kd,  axis_corners[6].kd,  axis_corners[7].kd,  axis_corners[8].kd,  axis_corners[9].kd,
+            axis_corners[10].kd, axis_corners[11].kd, axis_corners[12].kd, axis_corners[13].kd, axis_corners[14].kd, axis_corners[15].kd,
+            t_factor, a_factor, p_factor, s_factor);
+        
+        return result;
+    }
+    
+    // Data integrity
+    uint32_t calculateChecksum(const uint8_t* data, size_t length) const;
 }; 

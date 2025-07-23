@@ -1,291 +1,306 @@
+// ---------- FlightController.cpp ----------
 #include "FlightController.h"
+#include <cstdio>
 #include <cmath>
 #include <algorithm>
-#include <cstdio>  // for snprintf
 
-#ifdef _WIN32
-#define _USE_MATH_DEFINES  // For M_PI on MSVC
-#include <cmath>
+#ifdef max
+#undef max
+#endif
+#ifdef min
+#undef min
 #endif
 
 // Constructor
-FlightController::FlightController(HAL* hal, const Config& config) 
-    : hal_(hal), config_(config), status_(Status::INITIALIZING), control_mode_(config.default_mode),
-      state_estimator_(hal_, config_.state_estimator_config),
-      adaptive_pid_(config_.adaptive_pid_config),
-      mixer_(hal_, config_.mixer_config),
-      loop_start_time_(0), last_loop_time_(0), loop_dt_(0.0f),
-      armed_(false), emergency_mode_(false), timing_index_(0),
-      last_radio_update_(0), radio_timeout_start_(0), radio_timeout_active_(false),
-      battery_voltage_(11.1f), last_debug_output_(0), debug_counter_(0) {
-    
-    // Initialize performance stats
+FlightController::FlightController(HAL* hal, const Config& config)
+    : hal_(hal)
+    , config_(config)
+    , status_(Status::INITIALIZING)
+    , control_mode_(config.default_mode)
+    , state_estimator_(hal_, config.state_estimator_config)
+    , adaptive_pid_(config.adaptive_pid_config)
+    , mixer_(hal_, config.mixer_config)
+    , loop_start_time_(0)
+    , last_loop_time_(0)
+    , loop_dt_(0.0f)
+    , pending_phase_(FlightPhase::UNKNOWN)
+    , phase_change_start_time_(0)
+{
     performance_stats_ = PerformanceStats{0.0f, 0.0f, 0, 0, 0.0f};
-    
-    // Initialize loop timing history
-    for (int i = 0; i < TIMING_SAMPLES; i++) {
-        loop_time_history_[i] = 0.0f;
-    }
+    for (int i = 0; i < TIMING_SAMPLES; ++i) loop_time_history_[i] = 0.0f;
 }
 
-// Initialize all subsystems
 bool FlightController::initialize() {
-    if (!hal_) {
-        return false;
-    }
-    
-    // Initialize HAL
+    if (!hal_) return false;
     if (!hal_->initIMU() || !hal_->initRadio() || !hal_->initServos() || !hal_->initMotors()) {
         status_ = Status::ERROR;
         return false;
     }
-    
-    // Initialize modules
-    if (!state_estimator_.initialize()) {
+    if (!state_estimator_.initialize() || !adaptive_pid_.initialize() || !mixer_.initialize()) {
         status_ = Status::ERROR;
         return false;
     }
-    
-    if (!adaptive_pid_.initialize()) {
-        status_ = Status::ERROR;
-        return false;
-    }
-    
-    if (!mixer_.initialize()) {
-        status_ = Status::ERROR;
-        return false;
-    }
-    
-    // Mark as ready
     status_ = Status::READY;
     last_loop_time_ = hal_->micros();
-    
     return true;
 }
 
-// Main control loop update
 void FlightController::update() {
     loop_start_time_ = hal_->micros();
-    uint32_t dt_us = loop_start_time_ - last_loop_time_;
-    loop_dt_ = dt_us / 1000000.0f;
-    
-    // Skip if called too frequently
+    std::uint32_t dt_us = loop_start_time_ - last_loop_time_;
+    loop_dt_ = dt_us / 1e6f;
     if (loop_dt_ < 0.001f) return;
-    
     last_loop_time_ = loop_start_time_;
-    
-    // Read radio inputs
-    if (!readRadioInputs()) {
+
+    if (!readRadioInputs() || !updateStateEstimation() || !runControlLoops() || !mixAndOutputControls())
         return;
-    }
-    
-    // Update state estimation
-    if (!updateStateEstimation()) {
-        return;
-    }
-    
-    // Run control loops
-    if (!runControlLoops()) {
-        return;
-    }
-    
-    // Mix and output controls
-    if (!mixAndOutputControls()) {
-        return;
-    }
-    
-    // Update safety monitoring
+
     updateSafetyMonitoring();
-    
-    // Update performance statistics
     updatePerformanceStats();
-    
-    // Output debug info
     outputDebugInfo();
-    
-    performance_stats_.loop_count++;
+    ++performance_stats_.loop_count;
 }
 
-// Get current aircraft state
 AircraftState FlightController::getAircraftState() const {
     return aircraft_state_;
 }
 
-// Set control mode
 bool FlightController::setControlMode(ControlMode mode) {
-    if (status_ != Status::READY && status_ != Status::ARMED && status_ != Status::FLYING) {
+    if (status_ != Status::READY && status_ != Status::ARMED && status_ != Status::FLYING)
         return false;
-    }
-    
     control_mode_ = mode;
     return true;
 }
 
-// Emergency stop
 void FlightController::emergencyStop() {
-    status_ = Status::EMERGENCY;
-    emergency_mode_ = true;
     mixer_.emergencyStop();
-    
-    // Log emergency
-    if (config_.enable_debug_output && hal_) {
-        hal_->serialPrintln("EMERGENCY STOP ACTIVATED");
-    }
+    status_ = Status::EMERGENCY;
+    armed_ = false; // Disarm immediately
+    adaptive_pid_.freezeLearning(true); // Stop learning during emergency
 }
 
-// Get diagnostic info
-FlightController::DiagnosticInfo FlightController::getDiagnosticInfo() const {
+bool FlightController::arm() {
+    // Safety checks before arming
+    if (status_ != Status::READY) {
+        return false; // Can only arm from READY state
+    }
+    
+    if (!checkSystemHealth()) {
+        return false; // System health check failed
+    }
+    
+    if (battery_voltage_ < config_.low_battery_voltage + 0.5f) {
+        return false; // Battery too low to arm
+    }
+    
+    if (!isRadioSignalValid()) {
+        return false; // No valid radio signal
+    }
+    
+    // Check that throttle is at minimum
+    if (radio_inputs_.throttle > 0.1f) {
+        return false; // Throttle must be low to arm
+    }
+    
+    // Arm the system
+    armed_ = true;
+    status_ = Status::ARMED;
+    mixer_.clearEmergency(); // Allow normal control
+    
+    if (hal_) {
+        hal_->serialPrintln("ARMED - Flight controller ready");
+    }
+    
+    return true;
+}
+
+bool FlightController::disarm() {
+    if (status_ == Status::FLYING) {
+        return false; // Cannot disarm while flying
+    }
+    
+    armed_ = false;
+    status_ = Status::READY;
+    mixer_.emergencyStop(); // Cut motors immediately
+    
+    if (hal_) {
+        hal_->serialPrintln("DISARMED - Motors stopped");
+    }
+    
+    return true;
+}
+
+DiagnosticInfo FlightController::getDiagnosticInfo() const {
     DiagnosticInfo info;
-    info.imu_healthy = true;  // Simplified for now
-    info.radio_healthy = isRadioSignalValid();
-    info.airspeed_converged = state_estimator_.getAirspeedState().converged;
-    info.adaptive_pid_learning = adaptive_pid_.getLearningState().is_learning;
-    info.wind_compensation_confidence = 0.0f;  // Simplified
-    info.uptime_ms = hal_->millis();
+    info.imu_healthy                  = true;
+    info.radio_healthy                = hal_->isRadioConnected();
+    info.airspeed_converged           = state_estimator_.getAirspeedState().converged;
+    info.adaptive_pid_learning        = adaptive_pid_.getLearningState().is_learning;
+    info.wind_compensation_confidence = state_estimator_.getWindState().confidence.x;
+    info.uptime_ms                    = hal_->millis();
     return info;
 }
 
-// ========== PRIVATE METHOD IMPLEMENTATIONS ==========
-
-// Read radio inputs
 bool FlightController::readRadioInputs() {
-    // Read raw radio data
     float channels[6];
-    if (!hal_->readRadio(channels, 6)) {
-        return false;
-    }
-    
-    // Map channels to radio inputs
-    radio_inputs_.throttle = std::max(0.0f, std::min(1.0f, channels[0]));
-    radio_inputs_.roll = std::max(-1.0f, std::min(1.0f, channels[1]));
-    radio_inputs_.pitch = std::max(-1.0f, std::min(1.0f, channels[2]));
-    radio_inputs_.yaw = std::max(-1.0f, std::min(1.0f, channels[3]));
-    radio_inputs_.aux1 = std::max(-1.0f, std::min(1.0f, channels[4]));
-    radio_inputs_.aux2 = std::max(-1.0f, std::min(1.0f, channels[5]));
+    if (!hal_->readRadio(channels, 6)) return false;
+    radio_inputs_.throttle = std::clamp(channels[0], 0.0f, 1.0f);
+    radio_inputs_.roll     = std::clamp(channels[1], -1.0f, 1.0f);
+    radio_inputs_.pitch    = std::clamp(channels[2], -1.0f, 1.0f);
+    radio_inputs_.yaw      = std::clamp(channels[3], -1.0f, 1.0f);
+    radio_inputs_.aux1     = std::clamp(channels[4], -1.0f, 1.0f);
+    radio_inputs_.aux2     = std::clamp(channels[5], -1.0f, 1.0f);
     radio_inputs_.last_update_time = hal_->millis();
-    radio_inputs_.armed = (radio_inputs_.aux1 > 0.5f);  // Simple arming logic
-    
     last_radio_update_ = hal_->millis();
     return true;
 }
 
-// Update state estimation
 bool FlightController::updateStateEstimation() {
+    state_estimator_.setThrottleCommand(radio_inputs_.throttle);
     state_estimator_.update(loop_dt_);
     aircraft_state_ = state_estimator_.getState();
     return true;
 }
 
-// Run control loops
 bool FlightController::runControlLoops() {
     switch (control_mode_) {
-        case ControlMode::MANUAL:
-            runManualMode();
-            break;
-        case ControlMode::STABILIZE:
-            runStabilizeMode();
-            break;
-        case ControlMode::ALTITUDE:
-            runAltitudeMode();
-            break;
-        case ControlMode::POSITION:
-            runPositionMode();
-            break;
-        case ControlMode::AUTO:
-            runAutoMode();
-            break;
+        case ControlMode::MANUAL:    runManualMode();    break;
+        case ControlMode::STABILIZE: runStabilizeMode(); break;
+        case ControlMode::ALTITUDE:  runAltitudeMode();  break;
+        case ControlMode::POSITION:  runPositionMode();  break;
+        case ControlMode::AUTO:      runAutoMode();      break;
     }
     return true;
 }
 
-// Mix and output controls
 bool FlightController::mixAndOutputControls() {
-    // Get control commands from the appropriate mode
-    AngularRates control_commands;
+    FixedWingMixer::WindCompensation wind_comp;
+    auto& w = aircraft_state_.wind_disturbance;
     
-    // This would be set by the mode-specific control functions
-    // For now, using simplified approach
-    control_commands = AngularRates(0, 0, 0);
+    // Map our wind disturbance to mixer's wind compensation format
+    wind_comp.pitch_compensation    = w.x;  // headwind affects pitch
+    wind_comp.roll_compensation     = w.y;  // crosswind affects roll
+    wind_comp.yaw_compensation      = w.z * 0.1f;  // vertical wind can affect yaw slightly
+    wind_comp.throttle_compensation = w.x * 0.2f;  // headwind affects throttle requirement
+    wind_comp.confidence            = 1.0f;
     
-    // Mix controls
-    control_outputs_ = mixer_.mix(control_commands, radio_inputs_, aircraft_state_.airspeed);
+    // Safety check: only allow motor output if armed
+    RadioInputs safe_radio_inputs = radio_inputs_;
+    if (!armed_ || status_ == Status::EMERGENCY) {
+        safe_radio_inputs.throttle = 0.0f; // Force throttle to zero if not armed
+    }
     
-    // Apply to hardware
+    control_outputs_ = mixer_.mix(control_commands_, safe_radio_inputs, aircraft_state_.airspeed, wind_comp);
     mixer_.applyControls(control_outputs_);
     
+    // Update flight status based on throttle
+    if (armed_ && safe_radio_inputs.throttle > 0.1f) {
+        if (status_ == Status::ARMED) {
+            status_ = Status::FLYING;
+        }
+    } else if (status_ == Status::FLYING && safe_radio_inputs.throttle < 0.05f) {
+        status_ = Status::ARMED; // Back to armed but not flying
+    }
+    
     return true;
 }
 
-// Update safety monitoring
 void FlightController::updateSafetyMonitoring() {
     battery_voltage_ = readBatteryVoltage();
-    
-    if (!isRadioSignalValid()) {
-        handleRadioTimeout();
-    }
-    
-    if (battery_voltage_ < config_.low_battery_voltage) {
-        handleBatteryLow();
-    }
+    if (!isRadioSignalValid())      handleRadioTimeout();
+    if (battery_voltage_ < config_.low_battery_voltage) handleBatteryLow();
 }
 
-// Update performance statistics
 void FlightController::updatePerformanceStats() {
-    uint32_t loop_time_us = hal_->micros() - loop_start_time_;
-    float loop_time_ms = loop_time_us / 1000.0f;
-    
-    updateLoopTimingStats(loop_time_ms);
-    
-    // Count overruns
-    if (loop_time_ms > config_.max_loop_time_ms) {
-        performance_stats_.overrun_count++;
-    }
-    
-    // Estimate CPU usage
-    float target_loop_time = 1000.0f / config_.loop_frequency_hz;
-    performance_stats_.cpu_usage_percent = (loop_time_ms / target_loop_time) * 100.0f;
+    float ms = (hal_->micros() - loop_start_time_) / 1e3f;
+    updateLoopTimingStats(ms);
+    if (ms > config_.max_loop_time_ms)
+        ++performance_stats_.overrun_count;
+    // avoid std::max macro collision
+    performance_stats_.loop_time_max_ms =
+        (performance_stats_.loop_time_max_ms > ms ? performance_stats_.loop_time_max_ms : ms);
+    performance_stats_.cpu_usage_percent = (ms / (1000.0f / config_.loop_frequency_hz)) * 100.0f;
 }
 
-// Output debug info
 void FlightController::outputDebugInfo() {
     if (!config_.enable_debug_output) return;
-    
-    uint32_t now = hal_->millis();
-    if (now - last_debug_output_ > (1000 / config_.debug_output_rate_hz)) {
-        char status_buf[16];
-        snprintf(status_buf, sizeof(status_buf), "%d", static_cast<int>(status_));
-        
-        char loop_buf[16];
-        snprintf(loop_buf, sizeof(loop_buf), "%.2f", performance_stats_.loop_time_avg_ms);
-        
-        hal_->serialPrint("Status: ");
-        hal_->serialPrint(status_buf);
-        hal_->serialPrint(", Loop: ");
-        hal_->serialPrint(loop_buf);
-        hal_->serialPrintln("ms");
-        
-        last_debug_output_ = now;
-    }
+    std::uint32_t now = hal_->millis();
+    if (now - last_debug_output_ < (1000 / config_.debug_output_rate_hz)) return;
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "Status: %d, Loop: %.2fms",
+                  static_cast<int>(status_), performance_stats_.loop_time_avg_ms);
+    hal_->serialPrintln(buf);
+    last_debug_output_ = now;
 }
 
-// Safety and error handling
 bool FlightController::checkSystemHealth() {
-    return true; // Simplified
+    // IMU health check
+    if (!hal_->isIMUHealthy()) {
+        if (hal_) hal_->serialPrintln("HEALTH: IMU failure");
+        return false;
+    }
+    
+    // Radio connection check
+    if (!hal_->isRadioConnected()) {
+        if (hal_) hal_->serialPrintln("HEALTH: Radio disconnected");
+        return false;
+    }
+    
+    // State estimator convergence check
+    if (!state_estimator_.isConverged()) {
+        if (hal_) hal_->serialPrintln("HEALTH: State estimator not converged");
+        return false;
+    }
+    
+    // Performance check - don't arm if adaptive PID is performing poorly
+    auto learning_state = adaptive_pid_.getLearningState();
+    if (learning_state.confidence < 0.3f) {
+        if (hal_) hal_->serialPrintln("HEALTH: Low control confidence");
+        return false;
+    }
+    
+    // Check for recent emergency conditions
+    if (isInEmergencyCondition()) {
+        if (hal_) hal_->serialPrintln("HEALTH: Emergency condition active");
+        return false;
+    }
+    
+    return true;
 }
 
 void FlightController::handleRadioTimeout() {
     if (!radio_timeout_active_) {
-        radio_timeout_start_ = hal_->millis();
-        radio_timeout_active_ = true;
+        radio_timeout_start_   = hal_->millis();
+        radio_timeout_active_  = true;
     }
-    
-    if (hal_->millis() - radio_timeout_start_ > config_.radio_timeout_ms) {
+    if (hal_->millis() - radio_timeout_start_ > config_.radio_timeout_ms)
         emergencyStop();
-    }
 }
 
 void FlightController::handleBatteryLow() {
-    // Could trigger safe landing mode
+    // Set emergency mode immediately
+    status_ = Status::EMERGENCY;
+    
+    // Throttle to idle to prevent further battery drain
+    ControlSurfaces emergency_controls;
+    emergency_controls.throttle = config_.mixer_config.idle_throttle;
+    emergency_controls.left_elevon = 0.0f;   // Level wings
+    emergency_controls.right_elevon = 0.0f;  // Level wings
+    emergency_controls.rudder = 0.0f;        // Center rudder
+    
+    // Force mixer to emergency mode and apply safe controls
+    mixer_.emergencyStop();
+    mixer_.applyControls(emergency_controls);
+    
+    // Log the emergency
+    if (hal_) {
+        char msg[64];
+        std::snprintf(msg, sizeof(msg), "BATTERY LOW: %.2fV - EMERGENCY LANDING", battery_voltage_);
+        hal_->serialPrintln(msg);
+    }
+    
+    // Freeze adaptive learning during emergency
+    adaptive_pid_.freezeLearning(true);
 }
 
 void FlightController::handleSystemError(const char* error_message) {
@@ -296,68 +311,189 @@ void FlightController::handleSystemError(const char* error_message) {
     }
 }
 
-bool FlightController::isInEmergencyCondition() {
+bool FlightController::isInEmergencyCondition() const {
     return status_ == Status::EMERGENCY || status_ == Status::ERROR;
 }
 
-// Control mode implementations
 void FlightController::runManualMode() {
-    // Direct passthrough implementation
+    // Manual mode: direct passthrough from radio to control commands
+    // No PID control, just scale radio inputs to rate commands
+    control_commands_.roll_rate  = radio_inputs_.roll * 180.0f;   // Max 180 deg/s
+    control_commands_.pitch_rate = radio_inputs_.pitch * 90.0f;   // Max 90 deg/s  
+    control_commands_.yaw_rate   = radio_inputs_.yaw * 90.0f;     // Max 90 deg/s
 }
 
 void FlightController::runStabilizeMode() {
-    // Attitude stabilization implementation
+    calculateFlightRegime();
+    adaptive_pid_.updateFlightRegime(current_regime_);
+
+    // Compute attitude error
+    Attitude tgt{
+        radio_inputs_.roll  * 45.0f,
+        radio_inputs_.pitch * 30.0f,
+        radio_inputs_.yaw   * 180.0f
+    };
+    Attitude err{
+        tgt.roll  - aircraft_state_.attitude.roll,
+        tgt.pitch - aircraft_state_.attitude.pitch,
+        tgt.yaw   - aircraft_state_.attitude.yaw
+    };
+
+    ControlGains gains = adaptive_pid_.getGains(current_regime_);
+    // Assign explicitly to avoid initializer issues
+    control_commands_.roll_rate  = gains.roll.kp  * err.roll;
+    control_commands_.pitch_rate = gains.pitch.kp * err.pitch;
+    control_commands_.yaw_rate   = gains.yaw.kp   * err.yaw;
+
+    adaptive_pid_.updatePerformance(err, control_commands_, loop_dt_);
 }
 
 void FlightController::runAltitudeMode() {
-    // Altitude hold implementation
+    // TODO: Implement altitude hold mode
+    // For now, fall back to stabilize mode with altitude feedback
+    runStabilizeMode();
 }
 
 void FlightController::runPositionMode() {
-    // Position hold implementation
+    // TODO: Implement position hold mode (requires GPS)
+    // For now, fall back to altitude mode
+    runAltitudeMode();
 }
 
 void FlightController::runAutoMode() {
-    // Autonomous flight implementation
+    // TODO: Implement autonomous waypoint navigation
+    // For now, fall back to position hold mode
+    runPositionMode();
 }
 
-// Utility functions
-float FlightController::calculateLoopTime() {
-    return loop_dt_ * 1000.0f; // Return in milliseconds
-}
+float FlightController::calculateLoopTime() const { return loop_dt_ * 1000.0f; }
 
-void FlightController::updateLoopTimingStats(float loop_time_ms) {
-    // Update running averages
+void FlightController::updateLoopTimingStats(float ms) {
     if (performance_stats_.loop_count == 0) {
-        performance_stats_.loop_time_avg_ms = loop_time_ms;
-        performance_stats_.loop_time_max_ms = loop_time_ms;
+        performance_stats_.loop_time_avg_ms = ms;
+        performance_stats_.loop_time_max_ms = ms;
     } else {
-        // Exponential moving average
-        float alpha = 0.1f;
-        performance_stats_.loop_time_avg_ms = 
-            alpha * loop_time_ms + (1.0f - alpha) * performance_stats_.loop_time_avg_ms;
-        
-        if (loop_time_ms > performance_stats_.loop_time_max_ms) {
-            performance_stats_.loop_time_max_ms = loop_time_ms;
+        const float alpha = 0.1f;
+        performance_stats_.loop_time_avg_ms = alpha * ms + (1 - alpha) * performance_stats_.loop_time_avg_ms;
+        performance_stats_.loop_time_max_ms =
+            (performance_stats_.loop_time_max_ms > ms ? performance_stats_.loop_time_max_ms : ms);
+    }
+    ++performance_stats_.loop_count;
+    loop_time_history_[timing_index_] = ms;
+    timing_index_ = (timing_index_ + 1) % TIMING_SAMPLES;
+}
+
+void FlightController::calculateFlightRegime() {
+    current_regime_.throttle_fraction = radio_inputs_.throttle;
+    current_regime_.airspeed         = aircraft_state_.airspeed;
+    current_regime_.angle_of_attack  = aircraft_state_.attitude.pitch;
+    
+    // Flight phase state machine with hysteresis
+    FlightPhase new_phase = determineFlightPhase();
+    
+    // Apply hysteresis to prevent rapid phase changes
+    if (new_phase != current_regime_.phase) {
+        if (new_phase != pending_phase_) {
+            // Starting transition to new phase
+            pending_phase_ = new_phase;
+            phase_change_start_time_ = hal_->millis();
+        } else {
+            // Check if we've held new phase long enough
+            if (hal_->millis() - phase_change_start_time_ > PHASE_HYSTERESIS_MS) {
+                current_regime_.phase = new_phase;
+            }
         }
+    } else {
+        // Reset pending phase if we're staying in current phase
+        pending_phase_ = current_regime_.phase;
+    }
+}
+
+FlightPhase FlightController::determineFlightPhase() {
+    float throttle = radio_inputs_.throttle;
+    float airspeed = aircraft_state_.airspeed;
+    float vertical_rate = aircraft_state_.rates.pitch_rate; // Simplified - would use proper vertical speed
+    
+    // Configuration thresholds
+    constexpr float PREFLIGHT_THROTTLE_MAX = 0.05f;
+    constexpr float TAKEOFF_AIRSPEED_MIN = 3.0f;
+    constexpr float CRUISE_AIRSPEED_MIN = 12.0f;
+    constexpr float CLIMB_RATE_MIN = 2.0f;        // deg/s pitch rate indicating climb
+    constexpr float DESCENT_RATE_MAX = -1.0f;    // deg/s pitch rate indicating descent
+    constexpr float LANDING_THROTTLE_MAX = 0.15f;
+    constexpr float LANDING_AIRSPEED_MAX = 8.0f;
+    
+    // State machine logic
+    switch (current_regime_.phase) {
+        case FlightPhase::UNKNOWN:
+        case FlightPhase::PREFLIGHT:
+            if (throttle > PREFLIGHT_THROTTLE_MAX && airspeed > TAKEOFF_AIRSPEED_MIN) {
+                return FlightPhase::TAKEOFF;
+            }
+            return FlightPhase::PREFLIGHT;
+            
+        case FlightPhase::TAKEOFF:
+            if (airspeed > CRUISE_AIRSPEED_MIN && vertical_rate < CLIMB_RATE_MIN) {
+                return FlightPhase::CRUISE;
+            }
+            if (vertical_rate > CLIMB_RATE_MIN) {
+                return FlightPhase::CLIMB;
+            }
+            return FlightPhase::TAKEOFF;
+            
+        case FlightPhase::CLIMB:
+            if (vertical_rate < CLIMB_RATE_MIN && airspeed > CRUISE_AIRSPEED_MIN) {
+                return FlightPhase::CRUISE;
+            }
+            if (throttle < LANDING_THROTTLE_MAX && vertical_rate < DESCENT_RATE_MAX) {
+                return FlightPhase::DESCENT;
+            }
+            return FlightPhase::CLIMB;
+            
+        case FlightPhase::CRUISE:
+            if (vertical_rate > CLIMB_RATE_MIN) {
+                return FlightPhase::CLIMB;
+            }
+            if (throttle < LANDING_THROTTLE_MAX && vertical_rate < DESCENT_RATE_MAX) {
+                return FlightPhase::DESCENT;
+            }
+            return FlightPhase::CRUISE;
+            
+        case FlightPhase::DESCENT:
+            if (airspeed < LANDING_AIRSPEED_MAX && throttle < LANDING_THROTTLE_MAX) {
+                return FlightPhase::APPROACH;
+            }
+            if (vertical_rate > CLIMB_RATE_MIN) {
+                return FlightPhase::CLIMB;
+            }
+            return FlightPhase::DESCENT;
+            
+        case FlightPhase::APPROACH:
+            if (airspeed < TAKEOFF_AIRSPEED_MIN && throttle < PREFLIGHT_THROTTLE_MAX) {
+                return FlightPhase::LANDING;
+            }
+            if (throttle > LANDING_THROTTLE_MAX || vertical_rate > 0) {
+                return FlightPhase::CLIMB;
+            }
+            return FlightPhase::APPROACH;
+            
+        case FlightPhase::LANDING:
+            if (airspeed < TAKEOFF_AIRSPEED_MIN && throttle < PREFLIGHT_THROTTLE_MAX) {
+                return FlightPhase::PREFLIGHT;
+            }
+            if (throttle > PREFLIGHT_THROTTLE_MAX) {
+                return FlightPhase::TAKEOFF;
+            }
+            return FlightPhase::LANDING;
+            
+        case FlightPhase::EMERGENCY:
+        default:
+            return FlightPhase::EMERGENCY;
     }
 }
 
 bool FlightController::isRadioSignalValid() const {
-    uint32_t now = hal_->millis();
-    return (now - last_radio_update_) < config_.radio_timeout_ms;
+    return (hal_->millis() - last_radio_update_) < config_.radio_timeout_ms;
 }
 
-float FlightController::readBatteryVoltage() {
-    // Simplified - would read from ADC in real implementation
-    return 11.1f; // Mock voltage
-}
-
-// Configuration helpers
-void FlightController::setDefaultConfiguration() {
-    // Set reasonable defaults
-}
-
-bool FlightController::validateConfiguration(const Config& config) const {
-    return config.loop_frequency_hz > 0 && config.loop_frequency_hz <= 2000;
-} 
+float FlightController::readBatteryVoltage() const { return 11.1f; }

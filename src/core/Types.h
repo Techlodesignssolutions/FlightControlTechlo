@@ -125,10 +125,12 @@ struct ControlSurfaces {
 struct AircraftState {
     Attitude attitude;
     AngularRates rates;
-    Vector3 acceleration;  // Body frame, m/s²
-    float airspeed;        // m/s
-    float altitude;        // m (if available)
-    uint32_t timestamp;    // microseconds
+    Vector3 acceleration;      // Body frame, m/s² (bias and gravity corrected)
+    Vector3 linear_acceleration; // Body frame linear accel (gravity removed)
+    Vector3 wind_disturbance;  // Body frame wind acceleration (m/s²)
+    float airspeed;            // m/s
+    float altitude;            // m (if available)
+    uint32_t timestamp;        // microseconds
     
     AircraftState() : airspeed(0), altitude(0), timestamp(0) {}
 };
@@ -184,4 +186,52 @@ struct PerformanceMetrics {
     
     PerformanceMetrics() : overshoot(0), settling_time(0), steady_error(0), 
                           oscillation_freq(0), control_effort(0), health_score(50) {}
+}; 
+
+/**
+ * Performance statistics for loop timing and CPU usage
+ */
+struct PerformanceStats {
+    float loop_time_avg_ms;     // Average loop time in milliseconds
+    float loop_time_max_ms;     // Maximum loop time in milliseconds
+    uint32_t loop_count;        // Total number of loops executed
+    uint32_t overrun_count;     // Number of loop overruns
+    float cpu_usage_percent;    // CPU usage percentage
+    
+    PerformanceStats() : loop_time_avg_ms(0.0f), loop_time_max_ms(0.0f), 
+                        loop_count(0), overrun_count(0), cpu_usage_percent(0.0f) {}
+    
+    PerformanceStats(float avg, float max, uint32_t count, uint32_t overruns, float cpu)
+        : loop_time_avg_ms(avg), loop_time_max_ms(max), loop_count(count), 
+          overrun_count(overruns), cpu_usage_percent(cpu) {}
+};
+
+/**
+ * Wind compensation parameters for flight control
+ */
+struct WindCompensation {
+    float headwind_compensation;   // Compensation for headwind (m/s²)
+    float crosswind_compensation;  // Compensation for crosswind (m/s²) 
+    float vertical_compensation;   // Compensation for vertical wind (m/s²)
+    float confidence;              // Confidence level (0-1)
+    bool active;                   // Whether wind compensation is active
+    
+    WindCompensation() : headwind_compensation(0.0f), crosswind_compensation(0.0f),
+                        vertical_compensation(0.0f), confidence(0.0f), active(false) {}
+};
+
+/**
+ * Diagnostic information for system health monitoring
+ */
+struct DiagnosticInfo {
+    bool imu_healthy;                     // IMU sensor health
+    bool radio_healthy;                   // Radio receiver health
+    bool airspeed_converged;              // Airspeed estimation convergence
+    bool adaptive_pid_learning;           // PID learning state
+    float wind_compensation_confidence;   // Wind compensation confidence
+    uint32_t uptime_ms;                   // System uptime in milliseconds
+    
+    DiagnosticInfo() : imu_healthy(false), radio_healthy(false), 
+                      airspeed_converged(false), adaptive_pid_learning(false),
+                      wind_compensation_confidence(0.0f), uptime_ms(0) {}
 }; 

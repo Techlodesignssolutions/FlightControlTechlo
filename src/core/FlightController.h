@@ -1,181 +1,118 @@
+// ---------- FlightController.h ----------
 #pragma once
+
+#include <cstdint>
+#include <cstddef>
 #include "HAL.h"
 #include "Types.h"
 #include "../estimation/StateEstimator.h"
 #include "../control/AdaptivePID.h"
 #include "../mixing/FixedWingMixer.h"
-#include <stdint.h>
 
 /**
  * Main Flight Controller Class
- * 
- * This is the top-level coordinator that brings together all subsystems:
- * - State estimation (attitude, airspeed)
- * - Adaptive PID control with gain scheduling
- * - Wind disturbance rejection
- * - Fixed-wing control mixing
- * - Safety monitoring and failsafes
- * 
- * Design principles:
- * - Clean module interfaces
- * - Testable components
- * - Configurable behavior
- * - Robust error handling
  */
 class FlightController {
 public:
-    /**
-     * Overall flight controller configuration
-     */
     struct Config {
-        // System configuration
-        uint32_t loop_frequency_hz = 500;      // Control loop frequency
-        ControlMode default_mode = ControlMode::STABILIZE;
-        
-        // Module configurations
+        std::uint32_t loop_frequency_hz        = 500;
+        ControlMode    default_mode            = ControlMode::STABILIZE;
+
         StateEstimator::Config state_estimator_config;
-        AdaptivePID::Config adaptive_pid_config;
+        AdaptivePID::Config    adaptive_pid_config;
         FixedWingMixer::Config mixer_config;
-        
-        // Safety parameters
-        float max_attitude_error = 45.0f;      // Maximum attitude error before emergency (degrees)
-        float radio_timeout_ms = 1000.0f;      // Radio signal timeout (ms)
-        float low_battery_voltage = 10.5f;     // Low battery warning threshold (V)
-        
-        // Control loop timing
-        float max_loop_time_ms = 3.0f;         // Maximum acceptable loop time (ms)
-        bool enable_loop_timing_monitoring = true;
-        
-        // Debug and logging
-        bool enable_debug_output = true;
-        uint32_t debug_output_rate_hz = 10;    // Debug output frequency
+
+        float max_attitude_error           = 45.0f;
+        float radio_timeout_ms             = 1000.0f;
+        float low_battery_voltage          = 10.5f;
+        float max_loop_time_ms             = 3.0f;
+        bool  enable_loop_timing_monitoring = true;
+
+        bool        enable_debug_output    = true;
+        std::uint32_t debug_output_rate_hz = 10;
     };
-    
-    /**
-     * Flight controller status
-     */
+
     enum class Status {
-        INITIALIZING,    // System starting up
-        READY,          // Ready for flight
-        ARMED,          // Armed and ready for takeoff
-        FLYING,         // Actively flying
-        EMERGENCY,      // Emergency mode - safe landing
-        ERROR           // System error - land immediately
+        INITIALIZING,
+        READY,
+        ARMED,
+        FLYING,
+        EMERGENCY,
+        ERROR
     };
-    
-    /**
-     * Constructor
-     */
+
+    // Constructor / Lifecycle
     FlightController(HAL* hal, const Config& config = Config());
-    
-    /**
-     * Initialize the flight controller
-     * Returns true if initialization successful
-     */
     bool initialize();
-    
-    /**
-     * Main control loop update
-     * Call this at the configured loop frequency
-     */
     void update();
-    
-    /**
-     * Get current system status
-     */
-    Status getStatus() const { return status_; }
-    
-    /**
-     * Get current aircraft state
-     */
-    AircraftState getAircraftState() const;
-    
-    /**
-     * Get current control mode
-     */
-    ControlMode getControlMode() const { return control_mode_; }
-    
-    /**
-     * Set control mode (manual, stabilize, auto, etc.)
-     */
+
+    // Accessors
+    Status           getStatus()             const { return status_; }
+    AircraftState    getAircraftState()      const;
+    ControlMode      getControlMode()        const { return control_mode_; }
+    PerformanceStats getPerformanceStats()   const { return performance_stats_; }
+    DiagnosticInfo   getDiagnosticInfo()     const;
+
+    // Control
     bool setControlMode(ControlMode mode);
-    
-    /**
-     * Emergency stop - immediately safe the aircraft
-     */
     void emergencyStop();
-    
-    /**
-     * Get performance statistics
-     */
-    struct PerformanceStats {
-        float loop_time_avg_ms;     // Average loop time
-        float loop_time_max_ms;     // Maximum loop time
-        uint32_t loop_count;        // Total loop iterations
-        uint32_t overrun_count;     // Number of loop overruns
-        float cpu_usage_percent;    // Estimated CPU usage
-    };
-    PerformanceStats getPerformanceStats() const { return performance_stats_; }
-    
-    /**
-     * Configuration and tuning
-     */
-    bool loadConfiguration(const void* data, size_t size);
-    bool saveConfiguration(void* data, size_t* size) const;
-    
-    /**
-     * Diagnostic information
-     */
-    struct DiagnosticInfo {
-        bool imu_healthy;
-        bool radio_healthy;
-        bool airspeed_converged;
-        bool adaptive_pid_learning;
-        float wind_compensation_confidence;
-        uint32_t uptime_ms;
-    };
-    DiagnosticInfo getDiagnosticInfo() const;
-    
+    bool arm();           // Arm the flight controller with safety checks
+    bool disarm();        // Disarm the flight controller
+    bool isArmed() const  { return armed_; }
+
+    // Config persistence
+    bool loadConfiguration(const void* data, std::size_t size);
+    bool saveConfiguration(void* data, std::size_t* size) const;
+
 private:
+    // Hardware abstraction
     HAL* hal_;
     Config config_;
-    Status status_;
-    ControlMode control_mode_;
-    
-    // Core modules
+
+    // State
+    Status       status_;
+    ControlMode  control_mode_;
+
+    // Subsystems
     StateEstimator state_estimator_;
-    AdaptivePID adaptive_pid_;
+    AdaptivePID    adaptive_pid_;
     FixedWingMixer mixer_;
-    
-    // Current system state
-    AircraftState aircraft_state_;
-    RadioInputs radio_inputs_;
+
+    // Flight data
+    FlightRegime   current_regime_;
+    RadioInputs    radio_inputs_;
+    AircraftState  aircraft_state_;
     ControlSurfaces control_outputs_;
-    
-    // Control loop state
-    uint32_t loop_start_time_;
-    uint32_t last_loop_time_;
-    float loop_dt_;
-    bool armed_;
-    bool emergency_mode_;
-    
-    // Performance monitoring
-    PerformanceStats performance_stats_;
-    static const int TIMING_SAMPLES = 100;
-    float loop_time_history_[TIMING_SAMPLES];
-    int timing_index_;
-    
-    // Safety monitoring
-    uint32_t last_radio_update_;
-    uint32_t radio_timeout_start_;
-    bool radio_timeout_active_;
-    float battery_voltage_;
-    
+    AngularRates    control_commands_;
+
+    // Timing
+    std::uint32_t loop_start_time_;
+    std::uint32_t last_loop_time_;
+    float         loop_dt_;
+
+    // Flight phase tracking with hysteresis
+    FlightPhase pending_phase_;
+    std::uint32_t phase_change_start_time_;
+    static constexpr std::uint32_t PHASE_HYSTERESIS_MS = 500;
+
+    // Safety & performance
+    bool armed_{false};
+    bool emergency_mode_{false};
+    static constexpr int TIMING_SAMPLES = 100;
+    PerformanceStats      performance_stats_;
+    float                 loop_time_history_[TIMING_SAMPLES]{};
+    int                   timing_index_{0};
+
+    // Failsafe monitoring
+    std::uint32_t last_radio_update_{0};
+    std::uint32_t radio_timeout_start_{0};
+    bool          radio_timeout_active_{false};
+    float         battery_voltage_{0.0f};
+
     // Debug output
-    uint32_t last_debug_output_;
-    uint32_t debug_counter_;
-    
-    // Internal methods - Control Loop Steps
+    std::uint32_t last_debug_output_{0};
+
+    // Core steps
     bool readRadioInputs();
     bool updateStateEstimation();
     bool runControlLoops();
@@ -183,28 +120,23 @@ private:
     void updateSafetyMonitoring();
     void updatePerformanceStats();
     void outputDebugInfo();
-    
-    // Safety and error handling
+
+    // Helpers
     bool checkSystemHealth();
     void handleRadioTimeout();
     void handleBatteryLow();
     void handleSystemError(const char* error_message);
-    bool isInEmergencyCondition();
-    
-    // Control mode implementations
+    bool isInEmergencyCondition() const;
+
+    void calculateFlightRegime();
+    FlightPhase determineFlightPhase();
     void runManualMode();
     void runStabilizeMode();
     void runAltitudeMode();
     void runPositionMode();
     void runAutoMode();
-    
-    // Utility functions
-    float calculateLoopTime();
+    float calculateLoopTime() const;
     void updateLoopTimingStats(float loop_time_ms);
     bool isRadioSignalValid() const;
-    float readBatteryVoltage();
-    
-    // Configuration helpers
-    void setDefaultConfiguration();
-    bool validateConfiguration(const Config& config) const;
-}; 
+    float readBatteryVoltage() const;
+};

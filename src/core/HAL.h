@@ -25,6 +25,7 @@ public:
     // IMU Interface
     virtual bool initIMU() = 0;
     virtual bool readIMU(float* gyro_xyz, float* accel_xyz, float* mag_xyz) = 0;
+    virtual bool isIMUHealthy() = 0;  // Check if IMU is responding and healthy
     
     // Radio Interface  
     virtual bool initRadio() = 0;

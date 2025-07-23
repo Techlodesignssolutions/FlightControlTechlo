@@ -22,8 +22,9 @@ StateEstimator::StateEstimator(HAL* hal, const Config& config)
     // Initialize state
     current_state_ = AircraftState();
     airspeed_state_ = AirspeedState();
+    wind_state_ = WindState();
     
-    // Initialize EKF state
+    // Initialize EKF state - Extended: [airspeed, drag_coefficient, wind_disturbance_x]
     airspeed_state_.airspeed = config_.initial_airspeed;
     airspeed_state_.drag_coefficient = config_.initial_drag_coeff;
     airspeed_state_.confidence = 0.0f;
@@ -31,11 +32,23 @@ StateEstimator::StateEstimator(HAL* hal, const Config& config)
     airspeed_state_.innovation = 0.0f;
     airspeed_state_.last_update = 0;
     
-    // Initialize EKF
+    // Initialize wind state
+    wind_state_.disturbance_accel = Vector3(0, 0, 0);
+    wind_state_.confidence = Vector3(0, 0, 0);
+    wind_state_.update_rate = 0.0f;
+    wind_state_.converged = false;
+    wind_state_.last_update = 0;
+    
+    // Initialize Extended EKF - 3 states: [airspeed, drag_coeff, wind_disturbance_x]
     ekf_state_[0] = config_.initial_airspeed;
     ekf_state_[1] = config_.initial_drag_coeff;
-    ekf_covariance_[0] = 1.0f; ekf_covariance_[1] = 0.0f;
-    ekf_covariance_[2] = 0.0f; ekf_covariance_[3] = 1.0f;
+    ekf_state_[2] = 0.0f; // Initial wind disturbance
+    
+    // Initialize 3x3 covariance matrix
+    for (int i = 0; i < 9; i++) ekf_covariance_[i] = 0.0f;
+    ekf_covariance_[0] = 1.0f;  // P(0,0) - airspeed uncertainty
+    ekf_covariance_[4] = 1.0f;  // P(1,1) - drag coeff uncertainty  
+    ekf_covariance_[8] = 0.1f;  // P(2,2) - wind disturbance uncertainty
     ekf_initialized_ = false;
     
     // Initialize throttle dithering
@@ -112,9 +125,10 @@ bool StateEstimator::update(float dt) {
     // Update attitude estimation
     updateAttitude(dt);
     
-    // Update airspeed estimation
+    // Update airspeed estimation with wind separation
     if (config_.enable_airspeed_ekf) {
         updateAirspeed(dt);
+        updateWindEstimation(dt);
     }
     
     // Update throttle dithering
@@ -124,6 +138,8 @@ bool StateEstimator::update(float dt) {
     
     // Update current state structure
     current_state_.timestamp = current_time;
+    current_state_.airspeed = airspeed_state_.airspeed;
+    current_state_.wind_disturbance = wind_state_.disturbance_accel;
     
     return true;
 }
@@ -333,19 +349,25 @@ void StateEstimator::updateAttitude(float dt) {
     current_state_.acceleration = filtered_accel_;
 }
 
-// Update airspeed estimation
+// Update airspeed estimation using Extended EKF
 void StateEstimator::updateAirspeed(float dt) {
-    // Simple airspeed estimation (would be EKF in full implementation)
-    float thrust_estimate = effective_throttle_ * 10.0f; // Simplified thrust model
-    float drag_estimate = airspeed_state_.drag_coefficient * airspeed_state_.airspeed * airspeed_state_.airspeed;
+    // Use Extended EKF for thrust-drag-wind estimation
+    float thrust_force = thrustToForce(effective_throttle_);
     
-    // Simple dynamics: thrust - drag = mass * acceleration
-    float acceleration = (thrust_estimate - drag_estimate) / 1.0f; // Assume 1kg mass
-    airspeed_state_.airspeed += acceleration * dt;
-    airspeed_state_.airspeed = std::max(0.0f, airspeed_state_.airspeed); // Can't go backwards
+    // EKF predict step
+    ekfPredictExtended(dt, thrust_force);
     
-    // Update confidence (simplified)
+    // The EKF update will be called from updateWindEstimation()
+    // to ensure proper sensor frame conversion and gravity removal
+    
+    // Update confidence based on innovation
+    float abs_innovation = std::abs(airspeed_state_.innovation);
+    if (abs_innovation < 0.5f) { // Good innovation
     airspeed_state_.confidence = std::min(1.0f, airspeed_state_.confidence + dt * 0.1f);
+    } else { // Poor innovation
+        airspeed_state_.confidence = std::max(0.1f, airspeed_state_.confidence - dt * 0.05f);
+    }
+    
     airspeed_state_.converged = airspeed_state_.confidence > 0.8f;
     airspeed_state_.last_update = hal_->millis();
     
@@ -353,11 +375,25 @@ void StateEstimator::updateAirspeed(float dt) {
     current_state_.airspeed = airspeed_state_.airspeed;
 }
 
-// Update throttle dithering
+// Update throttle dithering (simple and robust)
 void StateEstimator::updateThrottleDither(float dt) {
-    dither_phase_ += 2.0f * 3.14159265f * config_.dither_frequency * dt;
+    // Generate simple sinusoidal dither
+    dither_phase_ += 2.0f * M_PI * config_.dither_frequency * dt;
+    
+    // Keep wrapping in reasonable range
+    if (dither_phase_ > 2.0f * M_PI) {
+        dither_phase_ -= 2.0f * M_PI;
+    }
+    
+    // Apply dither to commanded throttle
     float dither = config_.dither_amplitude * std::sin(dither_phase_);
-    effective_throttle_ = std::max(0.0f, std::min(1.0f, commanded_throttle_ + dither));
+    effective_throttle_ = commanded_throttle_ + dither;
+    
+    // Clamp to valid throttle range
+    effective_throttle_ = std::max(0.0f, std::min(1.0f, effective_throttle_));
+    
+    // Let the EKF learn whatever correlations actually exist
+    // No complex motor lag modeling - keep it simple and robust!
     last_dither_update_ = hal_->millis();
 }
 
@@ -390,39 +426,6 @@ int StateEstimator::getAOAZoneIndex(float aoa) const {
     return -1; // Invalid zone
 }
 
-// EKF predict step
-void StateEstimator::ekfPredict(float dt, float thrust_force) {
-    // Simplified EKF prediction
-    // State: [airspeed, drag_coefficient]
-    float predicted_accel = (thrust_force - ekf_state_[1] * ekf_state_[0] * ekf_state_[0]) / 1.0f;
-    ekf_state_[0] += predicted_accel * dt;
-    
-    // Predict covariance (simplified)
-    ekf_covariance_[0] += config_.process_noise_airspeed * dt;
-    ekf_covariance_[3] += config_.process_noise_drag * dt;
-}
-
-// EKF update step
-void StateEstimator::ekfUpdate(float measured_accel_x) {
-    // Simplified EKF update with acceleration measurement
-    float innovation = measured_accel_x - (thrustToForce(effective_throttle_) - ekf_state_[1] * ekf_state_[0] * ekf_state_[0]);
-    
-    // Kalman gain calculation (simplified)
-    float S = ekf_covariance_[0] + config_.measurement_noise;
-    float K = ekf_covariance_[0] / S;
-    
-    // State update
-    ekf_state_[0] += K * innovation;
-    
-    // Covariance update
-    ekf_covariance_[0] *= (1.0f - K);
-    
-    // Update airspeed state
-    airspeed_state_.airspeed = ekf_state_[0];
-    airspeed_state_.drag_coefficient = ekf_state_[1];
-    airspeed_state_.innovation = innovation;
-}
-
 // Thrust to force conversion
 float StateEstimator::thrustToForce(float throttle_fraction) const {
     return throttle_fraction * 10.0f; // Simplified thrust model
@@ -435,4 +438,163 @@ Vector3 StateEstimator::lowPassFilter(const Vector3& input, const Vector3& previ
         alpha * previous.y + (1.0f - alpha) * input.y,
         alpha * previous.z + (1.0f - alpha) * input.z
     );
+}
+
+// ========== ENHANCED WIND ESTIMATION METHODS ==========
+
+// Convert sensor frame acceleration to body frame
+Vector3 StateEstimator::sensorToBodyFrame(const Vector3& sensor_accel) const {
+    // Build rotation matrix from quaternion
+    float R[9];
+    buildRotationMatrix(R);
+    
+    // Apply rotation: body_accel = R * sensor_accel
+    return Vector3(
+        R[0] * sensor_accel.x + R[1] * sensor_accel.y + R[2] * sensor_accel.z,
+        R[3] * sensor_accel.x + R[4] * sensor_accel.y + R[5] * sensor_accel.z,
+        R[6] * sensor_accel.x + R[7] * sensor_accel.y + R[8] * sensor_accel.z
+    );
+}
+
+// Remove gravity from body-frame acceleration
+Vector3 StateEstimator::removeGravityFromAccel(const Vector3& body_accel) const {
+    // Gravity in body frame (rotated from [0, 0, -9.81])
+    Vector3 gravity_body;
+    float R[9];
+    buildRotationMatrix(R);
+    
+    // Earth gravity is [0, 0, -9.81] in earth frame
+    // Rotate to body frame: gravity_body = R * [0, 0, -9.81]
+    gravity_body.x = R[2] * (-9.81f);
+    gravity_body.y = R[5] * (-9.81f);
+    gravity_body.z = R[8] * (-9.81f);
+    
+    // Remove gravity to get linear acceleration
+    return body_accel - gravity_body;
+}
+
+// Build 3x3 rotation matrix from quaternion
+void StateEstimator::buildRotationMatrix(float R[9]) const {
+    // Convert quaternion to rotation matrix
+    float q0 = q0_, q1 = q1_, q2 = q2_, q3 = q3_;
+    
+    R[0] = 1 - 2*(q2*q2 + q3*q3);  R[1] = 2*(q1*q2 - q0*q3);      R[2] = 2*(q1*q3 + q0*q2);
+    R[3] = 2*(q1*q2 + q0*q3);      R[4] = 1 - 2*(q1*q1 + q3*q3);  R[5] = 2*(q2*q3 - q0*q1);
+    R[6] = 2*(q1*q3 - q0*q2);      R[7] = 2*(q2*q3 + q0*q1);      R[8] = 1 - 2*(q1*q1 + q2*q2);
+}
+
+// Update wind estimation using thrust-drag residual method
+void StateEstimator::updateWindEstimation(float dt) {
+    // Convert sensor acceleration to body frame and remove gravity
+    Vector3 body_accel = sensorToBodyFrame(filtered_accel_);
+    Vector3 linear_accel = removeGravityFromAccel(body_accel);
+    
+    // Store in state for debugging/logging
+    current_state_.acceleration = body_accel;
+    current_state_.linear_acceleration = linear_accel;
+    
+    // === 1D THRUST-DRAG BALANCE ON X-AXIS ===
+    // Predict longitudinal acceleration from thrust and drag
+    float thrust_force = thrustToForce(effective_throttle_);
+    float drag_force = ekf_state_[1] * ekf_state_[0] * ekf_state_[0]; // cd * v^2
+    float predicted_accel_x = (thrust_force - drag_force) / 1.0f; // assume 1kg mass
+    
+    // Residual = measured - predicted (this is wind + model error)
+    float residual_x = linear_accel.x - predicted_accel_x;
+    
+    // === FREQUENCY SEPARATION ===
+    // Fast component (throttle dither frequency) -> drag coefficient error
+    // Slow component (below dither frequency) -> wind disturbance
+    
+    // Update Extended EKF with X-axis measurement
+    ekfUpdateExtended(linear_accel.x);
+    
+    // Wind disturbance estimate from EKF state[2]
+    wind_state_.disturbance_accel.x = ekf_state_[2];
+    
+    // For Y and Z axes, no thrust/drag model -> pure wind estimation
+    // Apply simple low-pass filter to get slowly varying wind
+    float wind_alpha = 0.95f; // Heavy filtering for wind (slow dynamics)
+    wind_state_.disturbance_accel.y = wind_alpha * wind_state_.disturbance_accel.y + 
+                                     (1.0f - wind_alpha) * linear_accel.y;
+    wind_state_.disturbance_accel.z = wind_alpha * wind_state_.disturbance_accel.z + 
+                                     (1.0f - wind_alpha) * linear_accel.z;
+    
+    // Update confidence based on filter convergence
+    wind_state_.confidence.x = std::min(1.0f, wind_state_.confidence.x + dt * 0.1f);
+    wind_state_.confidence.y = std::min(1.0f, wind_state_.confidence.y + dt * 0.05f);
+    wind_state_.confidence.z = std::min(1.0f, wind_state_.confidence.z + dt * 0.05f);
+    wind_state_.converged = (wind_state_.confidence.x > 0.8f);
+    wind_state_.last_update = hal_->millis();
+}
+
+// Extended EKF predict step - now includes wind disturbance state
+void StateEstimator::ekfPredictExtended(float dt, float thrust_force) {
+    // State: [airspeed, drag_coefficient, wind_disturbance_x]
+    // Dynamics: 
+    //   airspeed: v' = (thrust - drag + wind) / mass
+    //   drag_coeff: constant (with process noise)
+    //   wind_disturbance: constant (with process noise)
+    
+    float predicted_accel = (thrust_force - ekf_state_[1] * ekf_state_[0] * ekf_state_[0] + ekf_state_[2]) / 1.0f;
+    ekf_state_[0] += predicted_accel * dt;
+    // ekf_state_[1] unchanged (drag coefficient)
+    // ekf_state_[2] unchanged (wind disturbance)
+    
+    // Process noise covariance update (simplified)
+    ekf_covariance_[0] += config_.process_noise_airspeed * dt;        // Airspeed uncertainty
+    ekf_covariance_[4] += config_.process_noise_drag * dt;            // Drag coeff uncertainty  
+    ekf_covariance_[8] += 0.01f * dt;                                 // Wind disturbance uncertainty
+}
+
+// Extended EKF update step
+void StateEstimator::ekfUpdateExtended(float measured_accel_x) {
+    // Measurement model: z = (thrust - drag + wind) / mass
+    float predicted_measurement = (thrustToForce(effective_throttle_) - 
+                                  ekf_state_[1] * ekf_state_[0] * ekf_state_[0] + 
+                                  ekf_state_[2]) / 1.0f;
+    
+    float innovation = measured_accel_x - predicted_measurement;
+    
+    // Measurement Jacobian H = [∂h/∂v, ∂h/∂cd, ∂h/∂wind] = [-2*cd*v/m, -v²/m, 1/m]
+    float H[3];
+    H[0] = -2.0f * ekf_state_[1] * ekf_state_[0] / 1.0f;  // ∂h/∂airspeed
+    H[1] = -ekf_state_[0] * ekf_state_[0] / 1.0f;         // ∂h/∂drag_coeff
+    H[2] = 1.0f / 1.0f;                                   // ∂h/∂wind_disturbance
+    
+    // Innovation covariance S = H*P*H' + R
+    float S = 0.0f;
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            S += H[i] * ekf_covariance_[i*3 + j] * H[j];
+        }
+    }
+    S += config_.measurement_noise;
+    
+    // Kalman gain K = P*H'/S
+    float K[3];
+    for (int i = 0; i < 3; i++) {
+        K[i] = 0.0f;
+        for (int j = 0; j < 3; j++) {
+            K[i] += ekf_covariance_[i*3 + j] * H[j];
+        }
+        K[i] /= S;
+    }
+    
+    // State update: x = x + K*innovation
+    for (int i = 0; i < 3; i++) {
+        ekf_state_[i] += K[i] * innovation;
+    }
+    
+    // Covariance update: P = (I - K*H)*P (simplified)
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            ekf_covariance_[i*3 + j] -= K[i] * H[j] * ekf_covariance_[i*3 + j];
+        }
+    }
+    
+    // Update airspeed state
+    airspeed_state_.airspeed = ekf_state_[0];
+    airspeed_state_.drag_coefficient = ekf_state_[1];
+    airspeed_state_.innovation = innovation;
 } 

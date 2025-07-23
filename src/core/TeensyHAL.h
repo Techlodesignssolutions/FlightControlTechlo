@@ -28,6 +28,7 @@ public:
     // IMU Interface
     bool initIMU() override;
     bool readIMU(float* gyro_xyz, float* accel_xyz, float* mag_xyz) override;
+    bool isIMUHealthy() override;
     
     // Radio Interface
     bool initRadio() override;
@@ -51,6 +52,13 @@ public:
     void setStatusLED(bool on) override;
     void blinkStatusLED(int count, int on_ms, int off_ms) override;
     
+    // PWM interrupt service routines (6 channels)
+    static void ISR_Ch1();
+    static void ISR_Ch2();
+    static void ISR_Ch3();
+    static void ISR_Ch4();
+    static void ISR_Ch5();
+    static void ISR_Ch6();
 private:
     HardwareConfig config_;
     Servo servos_[8];
@@ -66,6 +74,10 @@ private:
     // Radio-specific variables
     uint32_t last_radio_update_ = 0;
     bool radio_connected_ = false;
+    
+    // Raw pulse widths (microseconds) captured by ISRs
+    static volatile uint32_t ch_start_[6];
+    static volatile uint32_t ch_width_us_[6];
     
     // Internal helper methods
     bool calibrateIMU();

@@ -61,6 +61,17 @@ public:
         float innovation;        // Latest measurement innovation
         uint32_t last_update;    // Last update timestamp
     };
+
+    /**
+     * Wind disturbance estimation state
+     */
+    struct WindState {
+        Vector3 disturbance_accel;  // Body-frame wind acceleration (m/s²)
+        Vector3 confidence;         // Confidence per axis (0-1)
+        float update_rate;          // Update frequency (Hz)
+        bool converged;            // Has estimation converged?
+        uint32_t last_update;      // Last update timestamp
+    };
     
     /**
      * Constructor
@@ -99,6 +110,28 @@ public:
     AirspeedState getAirspeedState() const { return airspeed_state_; }
     
     /**
+     * Get wind disturbance state
+     */
+    WindState getWindState() const { return wind_state_; }
+    
+    /**
+     * Get body-frame linear acceleration (gravity removed)
+     */
+    Vector3 getLinearAcceleration() const { return current_state_.linear_acceleration; }
+    
+    /**
+     * Check if state estimation has converged
+     */
+    bool isConverged() const { 
+        return airspeed_state_.converged && wind_state_.converged; 
+    }
+    
+    /**
+     * Get wind disturbance acceleration vector
+     */
+    Vector3 getWindDisturbance() const { return current_state_.wind_disturbance; }
+    
+    /**
      * Set throttle command for airspeed estimation
      * The estimator may apply dithering for observability
      */
@@ -132,14 +165,15 @@ private:
     Config config_;
     AircraftState current_state_;
     AirspeedState airspeed_state_;
+    WindState wind_state_;
     
     // Attitude estimation (Madgwick filter)
     float q0_, q1_, q2_, q3_;  // Quaternion state
     bool attitude_initialized_;
     
-    // Airspeed EKF state
-    float ekf_state_[2];      // [airspeed, drag_coefficient]
-    float ekf_covariance_[4]; // 2x2 covariance matrix (stored as [P00, P01, P10, P11])
+    // Extended EKF state: [airspeed, drag_coefficient, wind_disturbance_x]
+    float ekf_state_[3];      // Extended to include wind disturbance
+    float ekf_covariance_[9]; // 3x3 covariance matrix
     bool ekf_initialized_;
     
     // Throttle dithering
@@ -178,9 +212,16 @@ private:
     float getDragCoefficientForAOA(float aoa) const;
     int getAOAZoneIndex(float aoa) const;
     
-    // EKF implementation
-    void ekfPredict(float dt, float thrust_force);
-    void ekfUpdate(float measured_accel_x);
+    // Enhanced methods for wind estimation
+    Vector3 sensorToBodyFrame(const Vector3& sensor_accel) const;
+    Vector3 removeGravityFromAccel(const Vector3& body_accel) const;
+    void updateWindEstimation(float dt);
+    void separateThrottleFrequencies(float dt);
+    
+    // Extended EKF implementation
+    void ekfPredictExtended(float dt, float thrust_force);
+    void ekfUpdateExtended(float measured_accel_x);
+    void buildRotationMatrix(float R[9]) const; // 3x3 rotation matrix from quaternion
     float thrustToForce(float throttle_fraction) const;
     
     // Low-pass filter helper
