@@ -18,9 +18,10 @@ public:
         std::uint32_t loop_frequency_hz        = 500;
         ControlMode    default_mode            = ControlMode::STABILIZE;
 
-        StateEstimator::Config state_estimator_config;
-        AdaptivePID::Config    adaptive_pid_config;
-        FixedWingMixer::Config mixer_config;
+        // Use default configurations for sub-modules
+        // StateEstimator::Config state_estimator_config;
+        // AdaptivePID::Config    adaptive_pid_config;
+        // FixedWingMixer::Config mixer_config;
 
         float max_attitude_error           = 45.0f;
         float radio_timeout_ms             = 1000.0f;
@@ -38,7 +39,7 @@ public:
         ARMED,
         FLYING,
         EMERGENCY,
-        ERROR
+        SYSTEM_ERROR
     };
 
     // Constructor / Lifecycle

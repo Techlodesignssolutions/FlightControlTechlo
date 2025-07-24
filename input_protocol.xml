@@ -1,0 +1,38 @@
+<PropertyList>
+  <generic>
+    <input>
+      <line_separator>newline</line_separator>
+      <var_separator>tab</var_separator>
+      
+      <!-- Primary control surfaces -->
+      <chunk>
+        <name>aileron</name>
+        <node>/controls/flight/aileron</node>
+        <type>float</type>
+        <format>%.6f</format>
+      </chunk>
+      
+      <chunk>
+        <name>elevator</name>
+        <node>/controls/flight/elevator</node>
+        <type>float</type>
+        <format>%.6f</format>
+      </chunk>
+      
+      <chunk>
+        <name>rudder</name>
+        <node>/controls/flight/rudder</node>
+        <type>float</type>
+        <format>%.6f</format>
+      </chunk>
+      
+      <chunk>
+        <name>throttle</name>
+        <node>/controls/engines/engine[0]/throttle</node>
+        <type>float</type>
+        <format>%.6f</format>
+      </chunk>
+      
+    </input>
+  </generic>
+</PropertyList> 

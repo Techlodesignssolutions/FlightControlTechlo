@@ -17,9 +17,9 @@ FlightController::FlightController(HAL* hal, const Config& config)
     , config_(config)
     , status_(Status::INITIALIZING)
     , control_mode_(config.default_mode)
-    , state_estimator_(hal_, config.state_estimator_config)
-    , adaptive_pid_(config.adaptive_pid_config)
-    , mixer_(hal_, config.mixer_config)
+    , state_estimator_(hal_, StateEstimator::Config{})
+    , adaptive_pid_(AdaptivePID::Config{})
+    , mixer_(hal_, FixedWingMixer::Config{})
     , loop_start_time_(0)
     , last_loop_time_(0)
     , loop_dt_(0.0f)
@@ -33,11 +33,11 @@ FlightController::FlightController(HAL* hal, const Config& config)
 bool FlightController::initialize() {
     if (!hal_) return false;
     if (!hal_->initIMU() || !hal_->initRadio() || !hal_->initServos() || !hal_->initMotors()) {
-        status_ = Status::ERROR;
+        status_ = Status::SYSTEM_ERROR;
         return false;
     }
     if (!state_estimator_.initialize() || !adaptive_pid_.initialize() || !mixer_.initialize()) {
-        status_ = Status::ERROR;
+        status_ = Status::SYSTEM_ERROR;
         return false;
     }
     status_ = Status::READY;
@@ -283,7 +283,7 @@ void FlightController::handleBatteryLow() {
     
     // Throttle to idle to prevent further battery drain
     ControlSurfaces emergency_controls;
-    emergency_controls.throttle = config_.mixer_config.idle_throttle;
+    emergency_controls.throttle = 0.0f;  // Emergency idle throttle
     emergency_controls.left_elevon = 0.0f;   // Level wings
     emergency_controls.right_elevon = 0.0f;  // Level wings
     emergency_controls.rudder = 0.0f;        // Center rudder
@@ -304,7 +304,7 @@ void FlightController::handleBatteryLow() {
 }
 
 void FlightController::handleSystemError(const char* error_message) {
-    status_ = Status::ERROR;
+    status_ = Status::SYSTEM_ERROR;
     if (hal_) {
         hal_->serialPrint("System Error: ");
         hal_->serialPrintln(error_message);
@@ -312,7 +312,7 @@ void FlightController::handleSystemError(const char* error_message) {
 }
 
 bool FlightController::isInEmergencyCondition() const {
-    return status_ == Status::EMERGENCY || status_ == Status::ERROR;
+    return status_ == Status::EMERGENCY || status_ == Status::SYSTEM_ERROR;
 }
 
 void FlightController::runManualMode() {
