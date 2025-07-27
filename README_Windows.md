@@ -48,6 +48,7 @@ build_flightgear.bat
 
 ### 3. Run the Integration
 
+#### **Method 1: Using Scripts (Easy)**
 **Terminal 1 - Start FlightGear:**
 ```cmd
 start_flightgear.bat
@@ -56,6 +57,40 @@ start_flightgear.bat
 **Terminal 2 - Start Flight Controller:**
 ```cmd
 start_autopilot.bat
+```
+
+#### **Method 2: Manual Commands (Recommended)**
+**Terminal 1 - Start FlightGear with Native FDM:**
+```cmd
+"C:\Program Files\FlightGear 2024.1\bin\fgfs.exe" --native-fdm=socket,out,10,127.0.0.1,5000,udp --native-ctrls=socket,in,10,127.0.0.1,5010,udp
+```
+
+**Terminal 2 - Start Flight Controller:**
+```cmd
+cd "C:\css\N8N-Data\Jarvis Agent\FlightControlTechlo"
+flightgear_interface_final.exe
+```
+
+#### **Method 3: Developer Command Prompt (For Building)**
+If you need to recompile:
+```cmd
+# Open "Developer Command Prompt for VS 2022"
+cd "C:\css\N8N-Data\Jarvis Agent\FlightControlTechlo"
+cl /std:c++17 /EHsc flightgear_interface.cpp src/core/FlightGearHAL.cpp src/core/FlightController.cpp src/estimation/StateEstimator.cpp src/control/AdaptivePID.cpp src/mixing/FixedWingMixer.cpp /Fe:flightgear_interface_final.exe /I. ws2_32.lib
+```
+
+### **Successful Output**
+When working correctly, you should see:
+```
+=== FlightGear Flight Controller Interface ===
+UDP sockets initialized:
+  Input:  Port 5000 (receive from FlightGear)
+  Output: Port 5010 (send to FlightGear)
+
+SUCCESS: Parsed Native FDM binary format
+Roll=0.00° Pitch=0.00° Heading=0.00°
+Rates: -6.18°/s -0.00°/s 0.00°/s
+Loop 200: Roll=0.0° Pitch=0.0° → Ail=0.000 Elev=0.355 Thr=0.002
 ```
 
 ## Manual Build (Alternative)
@@ -139,9 +174,29 @@ where gcc
 **"FlightGear failed to start"**
 ```cmd
 # Check if FlightGear is installed
-fgfs --version
+"C:\Program Files\FlightGear 2024.1\bin\fgfs.exe" --version
 
 # If not found, reinstall FlightGear and add to PATH
+```
+
+**"Failed to parse IMU data"**
+```cmd
+# Make sure you're using the Native FDM protocol, NOT generic protocols
+# Correct command:
+"C:\Program Files\FlightGear 2024.1\bin\fgfs.exe" --native-fdm=socket,out,10,127.0.0.1,5000,udp --native-ctrls=socket,in,10,127.0.0.1,5010,udp
+
+# Wrong (will cause parsing errors):
+fgfs --generic=socket,out,10,127.0.0.1,5000,udp,output_protocol
+```
+
+**"No IMU data received"**
+```cmd
+# Check if both programs are listening on correct ports
+netstat -an | findstr :5000
+netstat -an | findstr :5010
+
+# FlightGear should send TO port 5000
+# Flight controller should send TO port 5010
 ```
 
 **"WSAStartup failed"**

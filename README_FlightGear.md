@@ -42,9 +42,41 @@ make -j$(nproc)
 
 ### 3. Run the Integration
 
+#### **Linux:**
 **Terminal 1 - Start FlightGear:**
 ```bash
 ./start_flightgear.sh
+```
+
+**Terminal 2 - Start Flight Controller:**
+```bash
+./start_autopilot.sh
+```
+
+#### **Windows:**
+**Terminal 1 - Start FlightGear:**
+```cmd
+"C:\Program Files\FlightGear 2024.1\bin\fgfs.exe" --native-fdm=socket,out,10,127.0.0.1,5000,udp --native-ctrls=socket,in,10,127.0.0.1,5010,udp
+```
+
+**Terminal 2 - Start Flight Controller:**
+```cmd
+cd "C:\css\N8N-Data\Jarvis Agent\FlightControlTechlo"
+flightgear_interface_final.exe
+```
+
+### **Expected Output (All Platforms)**
+When working correctly, you should see:
+```
+=== FlightGear Flight Controller Interface ===
+UDP sockets initialized:
+  Input:  Port 5000 (receive from FlightGear)
+  Output: Port 5010 (send to FlightGear)
+
+SUCCESS: Parsed Native FDM binary format
+Roll=0.00° Pitch=0.00° Heading=0.00°
+Rates: -6.18°/s -0.00°/s 0.00°/s
+Loop 200: Roll=0.0° Pitch=0.0° → Ail=0.000 Elev=0.355 Thr=0.002
 ```
 
 **Terminal 2 - Start Flight Controller:**

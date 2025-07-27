@@ -1,0 +1,75 @@
+<PropertyList>
+  <generic>
+    <o>
+      <line_separator>newline</line_separator>
+      <var_separator>tab</var_separator>
+      
+      <!-- Aircraft attitude in degrees (needed for state estimation) -->
+      <chunk>
+        <n>roll-deg</n>
+        <node>/orientation/roll-deg</node>
+        <type>float</type>
+        <format>%.6f</format>
+      </chunk>
+      
+      <chunk>
+        <n>pitch-deg</n>
+        <node>/orientation/pitch-deg</node>
+        <type>float</type>
+        <format>%.6f</format>
+      </chunk>
+      
+      <chunk>
+        <n>heading-deg</n>
+        <node>/orientation/heading-deg</node>
+        <type>float</type>
+        <format>%.6f</format>
+      </chunk>
+      
+      <!-- Angular rates in degrees per second (gyroscope) -->
+      <chunk>
+        <n>roll-rate</n>
+        <node>/orientation/roll-rate-degps</node>
+        <type>float</type>
+        <format>%.6f</format>
+      </chunk>
+      
+      <chunk>
+        <n>pitch-rate</n>
+        <node>/orientation/pitch-rate-degps</node>
+        <type>float</type>
+        <format>%.6f</format>
+      </chunk>
+      
+      <chunk>
+        <n>yaw-rate</n>
+        <node>/orientation/yaw-rate-degps</node>
+        <type>float</type>
+        <format>%.6f</format>
+      </chunk>
+      
+      <!-- Linear accelerations in ft/s² (accelerometer) -->
+      <chunk>
+        <n>x-accel</n>
+        <node>/accelerations/pilot/x-accel-fps_sec</node>
+        <type>float</type>
+        <format>%.6f</format>
+      </chunk>
+      
+      <chunk>
+        <n>y-accel</n>
+        <node>/accelerations/pilot/y-accel-fps_sec</node>
+        <type>float</type>
+        <format>%.6f</format>
+      </chunk>
+      
+      <chunk>
+        <n>z-accel</n>
+        <node>/accelerations/pilot/z-accel-fps_sec</node>
+        <type>float</type>
+        <format>%.6f</format>
+      </chunk>
+      
+    </o>
+  </generic>
+</PropertyList> 

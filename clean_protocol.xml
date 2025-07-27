@@ -1,0 +1,8 @@
+<?xml version=\" "1.0\?> 
+<PropertyList> 
+  <generic> 
+    <output> 
+      <line_separator>newline</line_separator> 
+      <var_separator>tab</var_separator> 
+      <chunk> 
+        <name>roll-rate</name> 

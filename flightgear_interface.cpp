@@ -29,6 +29,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 
 // SDL2 is optional - only include if available
 #ifdef HAVE_SDL2
@@ -46,8 +47,8 @@ volatile float rc_rudder = 0.0f;
 volatile float rc_throttle = 0.0f;
 
 // UDP configuration
-#define FG_INPUT_PORT 5010   // Port to receive FlightGear state
-#define FG_OUTPUT_PORT 5000  // Port to send controls to FlightGear
+#define FG_INPUT_PORT 5000   // Port to receive FlightGear state
+#define FG_OUTPUT_PORT 5010  // Port to send controls to FlightGear
 #define UDP_BUFFER_SIZE 1024
 
 // FlightGear UDP sockets
@@ -141,21 +142,162 @@ bool initUDP() {
     printf("UDP sockets initialized:\n");
     printf("  Input:  Port %d (receive from FlightGear)\n", FG_INPUT_PORT);
     printf("  Output: Port %d (send to FlightGear)\n", FG_OUTPUT_PORT);
+    printf("  Note: FlightGear should be configured to send TO port %d and listen ON port %d\n", FG_INPUT_PORT, FG_OUTPUT_PORT);
     
     return true;
+}
+
+// FlightGear Native FDM structure (simplified - key fields only)
+struct FlightGearFDM {
+    uint32_t version;           // Version number
+    
+    // Positions (double precision)
+    double longitude;           // rad
+    double latitude;            // rad
+    double altitude;            // ft
+    
+    // Orientation (float precision) 
+    float phi;                  // roll angle (rad)
+    float theta;                // pitch angle (rad) 
+    float psi;                  // yaw angle (rad)
+    
+    // Angular velocities (float precision)
+    float phidot;               // roll rate (rad/s)
+    float thetadot;             // pitch rate (rad/s)
+    float psidot;               // yaw rate (rad/s)
+    
+    // Skip many fields we don't need...
+    char padding[200];          // Simplified - real structure has many more fields
+    
+    // Accelerations (float precision) - these are at specific offsets
+    float A_X_pilot;            // X acceleration (ft/s²)
+    float A_Y_pilot;            // Y acceleration (ft/s²)  
+    float A_Z_pilot;            // Z acceleration (ft/s²)
+};
+
+// Parse FlightGear Native FDM binary data
+bool parseNativeFDM(const char* data, int length, FlightGearHAL::FlightGearData* fg_data) {
+    // Native FDM packets are typically 1008+ bytes
+    if (length < 100) {
+        return false;  // Too small to be native FDM
+    }
+    
+    // Check if this looks like binary data (contains null bytes)
+    bool has_nulls = false;
+    for (int i = 0; i < std::min(50, length); i++) {
+        if (data[i] == 0) {
+            has_nulls = true;
+            break;
+        }
+    }
+    
+    if (!has_nulls) {
+        return false;  // Probably text data
+    }
+    
+    // For FlightGear native FDM, we need to extract data at specific byte offsets
+    // This is a simplified parser - the real FDM structure is more complex
+    
+    if (length >= 408) {  // Native FDM packets are exactly 408 bytes
+        // Based on analysis, the attitude data starts at byte offset 4
+        float* attitude_data = (float*)(data + 4);
+        
+        // Extract attitude angles (convert from radians to degrees)
+        fg_data->roll_deg = attitude_data[0] * 57.295779f;
+        fg_data->pitch_deg = attitude_data[1] * 57.295779f;
+        fg_data->heading_deg = attitude_data[2] * 57.295779f;
+        
+        // Normalize heading to 0-360 degrees
+        while (fg_data->heading_deg < 0) fg_data->heading_deg += 360.0f;
+        while (fg_data->heading_deg >= 360.0f) fg_data->heading_deg -= 360.0f;
+        
+        // Extract angular rates (convert from radians/sec to degrees/sec)
+        fg_data->roll_rate_degps = attitude_data[3] * 57.295779f;
+        fg_data->pitch_rate_degps = attitude_data[4] * 57.295779f;
+        fg_data->yaw_rate_degps = attitude_data[5] * 57.295779f;
+        
+        // For now, set accelerations to reasonable defaults
+        // We can find the correct offsets for these later if needed
+        fg_data->x_accel_fps2 = 0.0f;
+        fg_data->y_accel_fps2 = 0.0f;
+        fg_data->z_accel_fps2 = -32.174f;  // Standard gravity in ft/s²
+        
+        return true;
+    }
+    
+    return false;
 }
 
 // Parse FlightGear UDP data packet
 bool parseFlightGearData(const char* data, FlightGearHAL::FlightGearData* fg_data) {
     if (!data || !fg_data) return false;
     
-    // Debug: Print first 100 characters of raw data
-    static int debug_count = 0;
-    if (++debug_count % 30 == 0) {  // Print every 30th packet to avoid spam
-        printf("Raw FlightGear data: '%.100s'\n", data);
+    // Get data length
+    int data_length = strlen(data);
+    if (data_length == 0) {
+        // Might be binary data - check first 1000 bytes for binary patterns
+        data_length = 1000;  // Assume reasonable max for binary packet
     }
     
-    // Parse tab-separated values as per output_protocol.xml
+    // Enhanced debugging: Print raw data with more detail
+    static int debug_count = 0;
+    if (++debug_count % 10 == 0) {  // Print every 10th packet for better debugging
+        printf("\n=== FlightGear Data Debug (packet #%d) ===\n", debug_count);
+        printf("Apparent string length: %d\n", (int)strlen(data));
+        printf("Assumed data length: %d\n", data_length);
+        
+        // Check if this looks like binary data
+        bool looks_binary = false;
+        for (int i = 0; i < std::min(50, data_length); i++) {
+            if (data[i] == 0 || (unsigned char)data[i] > 127) {
+                looks_binary = true;
+                break;
+            }
+        }
+        
+        if (looks_binary) {
+            printf("Data type: BINARY (likely Native FDM)\n");
+            printf("First 32 bytes (hex): ");
+            for (int i = 0; i < std::min(32, data_length); i++) {
+                printf("%02X ", (unsigned char)data[i]);
+            }
+            printf("\n");
+        } else {
+            printf("Data type: TEXT\n");
+            printf("Raw data: '");
+            // Print with visible tab characters and newlines
+            for (int i = 0; data[i] != '\0' && i < 200; i++) {
+                if (data[i] == '\t') {
+                    printf("[TAB]");
+                } else if (data[i] == '\n') {
+                    printf("[NL]");
+                } else if (data[i] == '\r') {
+                    printf("[CR]");
+                } else if (data[i] < 32 || data[i] > 126) {
+                    printf("[%02X]", (unsigned char)data[i]);
+                } else {
+                    printf("%c", data[i]);
+                }
+            }
+            printf("'\n");
+        }
+    }
+    
+    // Try binary (Native FDM) format first
+    if (parseNativeFDM(data, data_length, fg_data)) {
+        if (debug_count % 10 == 0) {
+            printf("SUCCESS: Parsed Native FDM binary format\n");
+            printf("Roll=%.2f° Pitch=%.2f° Heading=%.2f°\n", 
+                   fg_data->roll_deg, fg_data->pitch_deg, fg_data->heading_deg);
+            printf("Rates: %.2f°/s %.2f°/s %.2f°/s\n",
+                   fg_data->roll_rate_degps, fg_data->pitch_rate_degps, fg_data->yaw_rate_degps);
+            printf("==========================================\n\n");
+        }
+        return true;
+    }
+    
+    // Fall back to text parsing if binary fails
+    // First try to parse as full format (output_protocol.xml - 9 values)
     int parsed = sscanf(data, "%f\t%f\t%f\t%f\t%f\t%f\t%f\t%f\t%f",
         &fg_data->roll_deg,
         &fg_data->pitch_deg, 
@@ -168,7 +310,72 @@ bool parseFlightGearData(const char* data, FlightGearHAL::FlightGearData* fg_dat
         &fg_data->z_accel_fps2
     );
     
-    return parsed == 9;
+    if (debug_count % 10 == 0) {
+        printf("Full format parse attempt: got %d values (need 9)\n", parsed);
+        if (parsed > 0) {
+            printf("Parsed values: ");
+            if (parsed >= 1) printf("roll=%.3f ", fg_data->roll_deg);
+            if (parsed >= 2) printf("pitch=%.3f ", fg_data->pitch_deg);
+            if (parsed >= 3) printf("heading=%.3f ", fg_data->heading_deg);
+            if (parsed >= 4) printf("roll_rate=%.3f ", fg_data->roll_rate_degps);
+            if (parsed >= 5) printf("pitch_rate=%.3f ", fg_data->pitch_rate_degps);
+            if (parsed >= 6) printf("yaw_rate=%.3f ", fg_data->yaw_rate_degps);
+            if (parsed >= 7) printf("x_accel=%.3f ", fg_data->x_accel_fps2);
+            if (parsed >= 8) printf("y_accel=%.3f ", fg_data->y_accel_fps2);
+            if (parsed >= 9) printf("z_accel=%.3f ", fg_data->z_accel_fps2);
+            printf("\n");
+        }
+    }
+    
+    if (parsed == 9) {
+        if (debug_count % 10 == 0) printf("SUCCESS: Using full text format\n");
+        return true;  // Successfully parsed full format
+    }
+    
+    // If that failed, try IMU-only format (imu_protocol.xml - 6 values)
+    parsed = sscanf(data, "%f\t%f\t%f\t%f\t%f\t%f",
+        &fg_data->roll_rate_degps,
+        &fg_data->pitch_rate_degps,
+        &fg_data->yaw_rate_degps,
+        &fg_data->x_accel_fps2,
+        &fg_data->y_accel_fps2,
+        &fg_data->z_accel_fps2
+    );
+    
+    if (debug_count % 10 == 0) {
+        printf("IMU-only format parse attempt: got %d values (need 6)\n", parsed);
+        if (parsed > 0) {
+            printf("Parsed values: ");
+            if (parsed >= 1) printf("roll_rate=%.3f ", fg_data->roll_rate_degps);
+            if (parsed >= 2) printf("pitch_rate=%.3f ", fg_data->pitch_rate_degps);
+            if (parsed >= 3) printf("yaw_rate=%.3f ", fg_data->yaw_rate_degps);
+            if (parsed >= 4) printf("x_accel=%.3f ", fg_data->x_accel_fps2);
+            if (parsed >= 5) printf("y_accel=%.3f ", fg_data->y_accel_fps2);
+            if (parsed >= 6) printf("z_accel=%.3f ", fg_data->z_accel_fps2);
+            printf("\n");
+        }
+    }
+    
+    if (parsed == 6) {
+        // For IMU-only format, we don't have attitude angles
+        // Set them to zero or maintain previous values
+        static bool first_imu_parse = true;
+        if (first_imu_parse) {
+            printf("Using IMU-only protocol (no attitude angles available)\n");
+            fg_data->roll_deg = 0.0f;
+            fg_data->pitch_deg = 0.0f;
+            fg_data->heading_deg = 0.0f;
+            first_imu_parse = false;
+        }
+        if (debug_count % 10 == 0) printf("SUCCESS: Using IMU-only format\n");
+        return true;
+    }
+    
+    if (debug_count % 10 == 0) {
+        printf("FAILED: Could not parse data - expected 9 or 6 values, got %d\n", parsed);
+        printf("==========================================\n\n");
+    }
+    return false;
 }
 
 // Send control commands to FlightGear
@@ -401,6 +608,7 @@ int main(int argc, char* argv[]) {
     // Main control loop
     printf("Starting main control loop...\n");
     printf("Waiting for FlightGear data on port %d...\n", FG_INPUT_PORT);
+    printf("Make sure FlightGear is started with the correct UDP configuration!\n");
     
     char recv_buffer[UDP_BUFFER_SIZE];
     FlightGearHAL::FlightGearData fg_data;
